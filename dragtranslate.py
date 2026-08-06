@@ -617,6 +617,7 @@ def grab_selected_text() -> str | None:
         return _grab_with_sentinel()  # non-Windows / API unavailable
 
     copied = False
+    seq_ours = seq_before
     for _ in range(2):  # a few apps need a second attempt
         with kb_controller.pressed(keyboard.Key.ctrl):
             kb_controller.press("c")
@@ -625,8 +626,10 @@ def grab_selected_text() -> str | None:
         # Excel or a remote desktop session can take several hundred.
         deadline = time.time() + 0.6
         while time.time() < deadline:
-            if clipboard_sequence() != seq_before:
+            current = clipboard_sequence()
+            if current != seq_before:
                 copied = True
+                seq_ours = current   # remember the state our own copy produced
                 break
             time.sleep(0.02)
         if copied:
@@ -644,7 +647,34 @@ def grab_selected_text() -> str | None:
         dbg("clipboard read failed:", e)
         clip = ""
 
-    if not clipboard_restore(snapshot):
+    # Deciding whether to put the old clipboard back.
+    #
+    # Our capture takes a few hundred milliseconds, and anything can copy during
+    # that window: a mouse-macro key bound to Ctrl+C, a clipboard manager, or the
+    # user pressing Ctrl+C themselves. Restoring blindly throws their copy away,
+    # which looks exactly like "Ctrl+C stopped working". So we only restore when
+    # we are confident the clipboard still holds *our* copy and nothing else:
+    #
+    #   * the sequence number advanced by exactly one (only our copy happened)
+    #   * and the contents have not changed since we read them
+    #
+    # If either check fails we leave the clipboard alone. Worst case the selected
+    # text stays on the clipboard, which is harmless - far better than destroying
+    # something the user deliberately copied.
+    seq_now = clipboard_sequence()
+    only_our_copy = (seq_ours is not None and seq_before is not None
+                     and seq_ours == seq_before + 1)
+    try:
+        unchanged = (pyperclip.paste() == clip)
+    except Exception:
+        unchanged = False
+
+    if not only_our_copy:
+        dbg(f"clipboard changed {seq_ours - seq_before} times during capture "
+            "- something else copied too, leaving it alone")
+    elif seq_now != seq_ours or not unchanged:
+        dbg("something else copied while we were reading - keeping their clipboard")
+    elif not clipboard_restore(snapshot):
         dbg("could not restore the previous clipboard contents")
 
     if not clip or not clip.strip():
@@ -1571,6 +1601,12 @@ def make_tray_icon(root: tk.Tk):
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
+# A loopback port used purely as a lock. Nothing is ever sent or received on it.
+# Pick an unusual number so an unrelated program is unlikely to hold it, which
+# would otherwise look like "DragTranslate is already running" and stop it dead.
+SINGLE_INSTANCE_PORT = 47821
+
+
 def ensure_single_instance() -> bool:
     """Prevents a second copy (e.g. autostart + manual launch) from running.
     The socket is released automatically when the process dies."""
@@ -1579,7 +1615,7 @@ def ensure_single_instance() -> bool:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock.bind(("127.0.0.1", 47653))
+        sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
         sock.listen(1)
     except OSError:
         sock.close()
