@@ -6,7 +6,7 @@ PDF readers, chat apps, terminals, games — anywhere you can select text.
 
 100+ languages · no API key · free and open source · single Python file
 
-![DragTranslate popups showing English to Korean, Korean to English, English to Japanese and English to Spanish translations, each in its own colour](docs/screenshot-popups.png)
+![DragTranslate popups: English, Japanese and Spanish each translated into Korean in their own colour, plus a Korean to English translation in the user's own colour](docs/screenshot-popups.png)
 
 ---
 
@@ -30,9 +30,10 @@ readable Python file you can inspect and modify.
   Korean, and DragTranslate works out which is which on every selection. Nothing to switch.
 - **Anything unlisted still works** — select a language you never configured and it is
   auto-detected and brought into your language anyway.
-- **Per-language colours** — each language gets its own accent colour and subtly tinted
-  popup, so Spanish and Japanese are instantly distinguishable even though both land in
-  your language. Fully customisable.
+- **Per-language colours** — text you read is shown in the colour of the language it was
+  written in, so Spanish and Japanese are instantly distinguishable even though both land
+  in your language. Text *you* wrote uses your own language's colour, so the direction is
+  obvious too. Fully customisable.
 - **Reads well on any screen** — the popup widens rather than growing endlessly downward,
   shrinks to fit, and always lands fully inside the monitor you are working on. Correct on
   multi-monitor setups.
@@ -50,8 +51,8 @@ readable Python file you can inspect and modify.
 
 **Requirements:** Windows 10 or 11. Nothing else — the installer takes care of Python.
 
-1. [Download this repository as a ZIP](../../archive/refs/heads/main.zip) and extract it
-   somewhere permanent, such as `C:\DragTranslate`.
+1. **[Download the latest release](../../releases/latest)** and extract it somewhere
+   permanent, such as `C:\DragTranslate`.
 2. Double-click **`install.bat`**.
 
 That is it. The installer runs hidden and shows a single dialog when it is finished. It
@@ -102,8 +103,10 @@ The settings window opens automatically on first launch, and any time from the t
   language it goes to the outgoing language you pick. A language that is not on the list is
   auto-detected and translated into your language too.
 - **Fixed direction** — always translate from one language (or auto-detect) into another.
-- **Colour...** assigns a colour to the selected language, so you can tell at a glance
-  whether you are looking at Spanish or Japanese.
+- **Colour...** assigns a colour to the selected language. Text you *read* takes the colour
+  of the language it was written in (English blue, Spanish orange, Japanese pink…), while
+  text you *wrote* takes your own language's colour — so both the language and the
+  direction are visible at a glance. The swatch beside **My language** sets that one.
 - **Popup duration**, **text size**, and the **English verb list** are all adjustable.
 - **Debug log** is off by default. It records translated text, so leave it off unless you
   are chasing a problem.
@@ -246,8 +249,8 @@ their licences.
 
 윈도우 10 또는 11이면 됩니다. 파이썬은 설치 파일이 알아서 처리합니다.
 
-1. 이 저장소를 [ZIP으로 내려받아](../../archive/refs/heads/main.zip) `C:\DragTranslate` 같은
-   폴더에 풀어주세요.
+1. **[최신 릴리스를 내려받아](../../releases/latest)** `C:\DragTranslate` 같은 폴더에
+   풀어주세요.
 2. **`install.bat`** 을 더블클릭하세요.
 
 검은 창 없이 조용히 설치되고, 끝나면 안내 창이 하나 뜹니다. 관리자 권한은 필요 없습니다.
@@ -263,7 +266,8 @@ their licences.
 한국어를 드래그했을 때 어떤 언어로 번역할지는 따로 지정합니다.
 
 언어마다 팝업 색을 다르게 지정할 수 있어서, 똑같이 한국어로 번역되더라도 원문이
-스페인어였는지 일본어였는지 색만 보고 구분됩니다.
+스페인어였는지 일본어였는지 색만 보고 구분됩니다. 반대로 내가 쓴 한국어를 번역할 때는
+내 언어의 색으로 떠서 방향도 한눈에 구분됩니다.
 
 번역한 내용은 `vocabulary.db` 파일에 자동으로 쌓여서 나만의 단어장이 됩니다. 영어를
 번역할 때는 주요 동사를 따로 뽑아서 함께 보여줍니다.

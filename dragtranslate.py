@@ -900,17 +900,25 @@ def accent_for(lang_code: str) -> str:
 
 
 def accent_language(source: str, target: str) -> str:
-    """Colour the popup by the *foreign* language of the pair, so English, Spanish
-    and Japanese are each instantly recognisable even though they all translate
-    into the same home language."""
-    home = CONFIG.get("my_language", "ko")
+    """Which language's colour the popup is painted with.
+
+    Incoming (foreign -> my language) uses the *foreign* language's colour, so
+    English, Spanish and Japanese stay distinct even though all three land in the
+    same language. Outgoing (my language -> foreign) uses my own language's
+    colour, so the direction is obvious too: one colour means "I wrote this",
+    every other colour means "this was foreign".
+    """
+    home = _base(CONFIG.get("my_language", "ko"))
+    src, tgt = _base(source), _base(target)
+
     if CONFIG.get("mode") == "fixed":
-        return target if target != "auto" else source
-    if _base(source) == _base(home):
-        return target
-    if _base(target) == _base(home):
-        return source if _base(source) != "auto" else target
-    return target
+        return target if tgt != "auto" else source
+
+    if src == home:
+        return home          # outgoing
+    if src == "auto":
+        return "_default"    # incoming, but the language was not recognised
+    return src               # incoming, from a known language
 
 
 def _hex_to_rgb(h: str) -> tuple[int, int, int]:
@@ -1260,6 +1268,15 @@ class SettingsWindow:
         self.cmb_out = ttk.Combobox(frm, state="readonly", width=30)
         self.cmb_out.grid(row=5, column=1, sticky="w", **pad)
 
+        self.lbl_hint = ttk.Label(
+            frm, foreground="#555555", justify="left",
+            text=("Colours: text you read is shown in the colour of the language it was\n"
+                  "written in. Text you wrote uses your own language's colour, so the\n"
+                  "direction is obvious at a glance."))
+        self.lbl_hint.grid(row=5, column=2, sticky="w", padx=12, pady=6)
+        self.lbl_hint.grid_remove()
+        self.lbl_hint.grid_configure(row=6, column=0, columnspan=3)
+
         # --- fixed mode ---
         self.lbl_s = ttk.Label(frm, text="Translate from")
         self.lbl_s.grid(row=6, column=0, sticky="w", **pad)
@@ -1410,7 +1427,7 @@ class SettingsWindow:
         multi = self.mode.get() == "multi"
         multi_widgets = (self.lbl_home, self.cmb_home, self.btn_home,
                          self.lbl_list, self.list_box, self.add_row,
-                         self.lbl_out, self.cmb_out)
+                         self.lbl_out, self.cmb_out, self.lbl_hint)
         fixed_widgets = (self.lbl_s, self.cmb_s, self.lbl_t, self.cmb_t, self.btn_t)
         for widget in multi_widgets:
             widget.grid() if multi else widget.grid_remove()
