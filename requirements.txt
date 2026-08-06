@@ -1,0 +1,11 @@
+# DragTranslate dependencies
+pynput>=1.7          # global mouse/keyboard hooks              (LGPL-3.0)
+pyperclip>=1.8       # clipboard read/write                     (BSD-3-Clause)
+deep-translator>=1.11 # Google Translate backend                (MIT)
+pystray>=0.19        # system tray icon                         (LGPL-3.0)
+pillow>=9.0          # tray icon rendering                      (MIT-CMU)
+nltk>=3.8            # English verb detection (optional feature) (Apache-2.0)
+
+# Optional: better language detection between two Latin-script languages.
+# Without it, a built-in stopword table is used instead.
+# langdetect>=1.0.9
