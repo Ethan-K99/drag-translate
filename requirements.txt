@@ -5,6 +5,8 @@ deep-translator>=1.11 # Google Translate backend                (MIT)
 pystray>=0.19        # system tray icon                         (LGPL-3.0)
 pillow>=9.0          # tray icon rendering                      (MIT-CMU)
 nltk>=3.8            # English verb detection (optional feature) (Apache-2.0)
+truststore>=0.9      # verify HTTPS against the OS trust store    (MIT)
+certifi>=2023.7      # fallback CA bundle                         (MPL-2.0)
 
 # Optional: better language detection between two Latin-script languages.
 # Without it, a built-in stopword table is used instead.

@@ -117,7 +117,9 @@ if not exist "%PYW%" set "PYW=%PY%"
 REM ---------- 2. packages ----------
 >> "%LOG%" echo [2/6] installing Python packages...
 "%PY%" -m pip install --upgrade pip --quiet >> "%LOG%" 2>&1
-"%PY%" -m pip install --quiet pynput pyperclip deep-translator pystray pillow nltk >> "%LOG%" 2>&1
+REM truststore makes HTTPS verify against the Windows certificate store, so the
+REM app keeps working on a company network that inspects TLS with its own root.
+"%PY%" -m pip install --quiet pynput pyperclip deep-translator pystray pillow nltk truststore certifi >> "%LOG%" 2>&1
 if !errorlevel! neq 0 (
     >> "%LOG%" echo [error] pip install failed
     set "HT_MSG=Could not install the required Python packages.||Check your internet connection and try again.|Details are in install_log.txt"
@@ -128,7 +130,10 @@ if !errorlevel! neq 0 (
 
 REM ---------- 3. language data ----------
 >> "%LOG%" echo [3/6] downloading English language data...
-"%PY%" -c "import nltk;[nltk.download(p,quiet=True) for p in ['punkt','punkt_tab','averaged_perceptron_tagger','averaged_perceptron_tagger_eng']]" >> "%LOG%" 2>&1
+REM Run this through the app itself, not a bare python -c: the app sets up
+REM certificate trust on import, so this works on a network that inspects TLS.
+"%PY%" "%SCRIPT%" --fetch-langdata >> "%LOG%" 2>&1
+if !errorlevel! neq 0 >> "%LOG%" echo     [warn] language data unavailable - the verb list will be empty, translation is unaffected
 >> "%LOG%" echo     done
 
 REM ---------- 4. stop a running copy ----------

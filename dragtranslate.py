@@ -8,6 +8,7 @@ no copy-paste, no switching windows.
 Features
   * Works in any Windows application, not just the browser
   * 100+ languages (Google Translate backend, no API key required)
+  * Optional fully offline engine: Tencent Hy-MT2-1.8B running in Ollama
   * Two-way mode: automatically figures out which direction to translate
   * Per-language colour themes so you can tell the direction at a glance
   * Automatic vocabulary log (SQLite) of everything you look up
@@ -33,6 +34,7 @@ import time
 from datetime import datetime
 
 APP_NAME = "DragTranslate"
+APP_VERSION = "1.3.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "vocabulary.db")
@@ -70,9 +72,365 @@ def _setup_console_fallback() -> None:
 
 _setup_console_fallback()
 
+def _setup_ssl_trust():
+    """Make HTTPS work behind a corporate TLS-inspecting proxy.
+
+    Company networks routinely run an appliance (Zscaler, Netskope, Fortinet,
+    Palo Alto, Sophos...) that terminates every TLS connection and re-signs it
+    with the company's own root certificate. Windows and macOS trust that root,
+    because IT installed it in the OS trust store - but Python does not. The
+    `requests` library ships its own CA list (certifi) and ignores the OS
+    entirely, so the re-signed certificate looks forged and the connection dies
+    with CERTIFICATE_VERIFY_FAILED before a single byte reaches Google.
+
+    Nothing is blocked and nothing is being rate-limited; Python simply does
+    not recognise the middlebox. Three ways out, best first:
+
+      1. `truststore`, which routes verification through the OS trust store
+         (Windows CryptoAPI / macOS Security). It therefore trusts exactly what
+         the browser on the same machine trusts, and needs no maintenance when
+         IT rotates the certificate.
+      2. An explicit bundle: `ca_bundle` in config.json, or the standard
+         REQUESTS_CA_BUNDLE / SSL_CERT_FILE variables. For an exported .pem.
+      3. certifi, the normal public CA list - correct on a home network, and
+         the only option that works on a python.org macOS build, which ships
+         with no CA bundle at all.
+
+    Returns a short description of what happened, for --check and the log.
+    """
+    # An explicit bundle wins: someone set it deliberately.
+    bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if not bundle:
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                bundle = (json.load(f) or {}).get("ca_bundle") or ""
+        except Exception:
+            bundle = ""
+    if bundle and os.path.exists(bundle):
+        os.environ["REQUESTS_CA_BUNDLE"] = bundle
+        os.environ["SSL_CERT_FILE"] = bundle
+        return f"explicit CA bundle: {bundle}"
+
+    try:
+        import truststore
+        truststore.inject_into_ssl()
+        return "OS trust store (truststore)"
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[ssl] truststore present but could not be used: {e}")
+
+    try:
+        import certifi
+        os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+        return f"certifi: {certifi.where()}"
+    except Exception:
+        return "Python default (neither truststore nor certifi is installed)"
+
+
+SSL_TRUST_SOURCE = _setup_ssl_trust()
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def _use_browser_user_agent() -> bool:
+    """Ask Google for the page a browser gets, not the one a script gets.
+
+    deep-translator scrapes translate.google.com/m and calls requests.get()
+    with no headers at all, so Google sees `python-requests/2.x` and may answer
+    with something that does not contain the element being parsed. That surfaces
+    as `TranslationNotFound`, which reads like the text could not be translated
+    rather than like the page was never the right page.
+
+    requests.sessions does `from .utils import default_headers`, so the name has
+    to be replaced in the sessions module; patching requests.utils alone changes
+    nothing. Only the default is touched - an explicit header still wins."""
+    try:
+        import requests.sessions
+        import requests.utils
+        original = requests.utils.default_headers
+
+        def with_browser_ua():
+            headers = original()
+            headers["User-Agent"] = BROWSER_UA
+            return headers
+
+        requests.utils.default_headers = with_browser_ua
+        requests.sessions.default_headers = with_browser_ua
+        return True
+    except Exception as e:
+        print(f"[net] could not set a browser User-Agent: {e}")
+        return False
+
+
+USING_BROWSER_UA = _use_browser_user_agent()
+
 import pyperclip
 from pynput import mouse, keyboard
 from deep_translator import GoogleTranslator
+
+
+# --------------------------------------------------------------------------
+# Choosing a translation engine
+# --------------------------------------------------------------------------
+# The free Google endpoint has no account behind it, so its rate limit is
+# counted against whatever public IP address the request leaves from. On a
+# company network that address is shared with everyone in the building, which
+# means the limit can be exhausted by people and software that have nothing to
+# do with this app - and no amount of restraint here wins it back.
+#
+# An API key moves the quota onto the key. That is the only change that
+# actually decouples this from the shared address, so the engine is pluggable.
+# The key lives in config.json on this machine and is never sent anywhere
+# except to the service it belongs to.
+
+ENGINES = {
+    "google": {
+        "label": "Google (free, no key - shares the network's rate limit)",
+        "needs_key": False,
+    },
+    "microsoft": {
+        "label": "Microsoft Translator (free tier: 2,000,000 characters/month, key required)",
+        "needs_key": True,
+        "signup": "https://portal.azure.com  (create a 'Translator' resource, pricing tier F0)",
+    },
+    "libre": {
+        "label": "LibreTranslate (self-hosted or public instance, url + key required)",
+        "needs_key": True,
+    },
+    "ollama": {
+        "label": "Local model via Ollama (offline, nothing leaves this PC)",
+        "needs_key": False,
+    },
+}
+# DeepL is deliberately absent. It translates Korean well, but deep-translator
+# validates the language against its own hardcoded list, which has no Korean in
+# it, so DeeplTranslator(target="ko") is rejected before a request is ever made.
+# Offering it would send a Korean user down a dead end.
+
+
+def engine_name() -> str:
+    name = str(CONFIG.get("engine", "google")).strip().lower()
+    return name if name in ENGINES else "google"
+
+
+def engine_problem() -> str:
+    """Everything missing before the configured engine can be used, or ''.
+
+    All of it at once, not the first thing found: discovering one requirement,
+    fixing it, and then being told about the next is how a five-minute setup
+    turns into an afternoon."""
+    name = engine_name()
+    spec = ENGINES[name]
+    missing = []
+    if spec["needs_key"] and not str(CONFIG.get("api_key", "")).strip():
+        signup = spec.get("signup", "")
+        missing.append('"api_key": "..."' + (f"  (sign up at {signup})" if signup else ""))
+    if name == "libre" and not str(CONFIG.get("api_url", "")).strip():
+        missing.append('"api_url": "https://your-instance/translate"')
+    if name == "microsoft" and not str(CONFIG.get("api_region", "")).strip():
+        missing.append('"api_region": "koreacentral"  (whichever region your '
+                       'Azure resource is in)')
+    if not missing:
+        return ""
+    return (f"{name} is not set up yet. Add to config.json: "
+            + "; ".join(missing))
+
+
+# MicrosoftTranslator fetches the supported-language list from the API inside
+# its constructor. Building one per translation would therefore double the
+# requests - the exact problem this whole exercise is about - so instances are
+# reused. The cache key is a hash, never the key itself, so a credential cannot
+# surface in a repr or a traceback.
+_translator_cache: dict = {}
+_translator_lock = threading.Lock()
+
+
+def _engine_fingerprint(name: str) -> str:
+    import hashlib
+    raw = "|".join([name,
+                    str(CONFIG.get("api_key", "")),
+                    str(CONFIG.get("api_region", "")),
+                    str(CONFIG.get("api_url", ""))])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------
+# Local engine: Ollama
+# --------------------------------------------------------------------------
+# Ollama runs on this PC and serves an HTTP API on localhost, so a selection
+# never leaves the machine and there is no shared rate limit to run into.
+# The default model is Tencent's Hy-MT2 1.8B, a translation-only model; the
+# prompts below are the ones from its model card.
+OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434"
+OLLAMA_DEFAULT_MODEL = "hf.co/tencent/Hy-MT2-1.8B-GGUF:Q4_K_M"
+
+_HYMT_PROMPT_EN = ("Translate the following text into {lang}. Note that you should "
+                   "only output the translated result without any additional "
+                   "explanation:\n\n{text}")
+# Hy-MT2's special tokens, as its chat_template writes them.
+_HY_BOS = "<｜hy_begin▁of▁sentence｜>"
+_HY_USER = "<｜hy_User｜>"
+_HY_ASSISTANT = "<｜hy_Assistant｜>"
+_HY_EOS = "<｜hy_place▁holder▁no▁2｜>"
+_HYMT_PROMPT_ZH ="将以下文本翻译为{lang}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
+
+# Hy-MT2 wants the language by name. Anything not listed falls back to the
+# name from the language table, which is good enough for the model.
+_LANG_NAMES_EN = {
+    "en": "English", "ko": "Korean", "ja": "Japanese",
+    "zh-CN": "Simplified Chinese", "zh-TW": "Traditional Chinese",
+    "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "ru": "Russian", "ar": "Arabic", "hi": "Hindi",
+    "vi": "Vietnamese", "th": "Thai", "id": "Indonesian", "tr": "Turkish",
+    "pl": "Polish", "nl": "Dutch", "ms": "Malay", "tl": "Filipino",
+    "uk": "Ukrainian", "cs": "Czech", "fa": "Persian", "iw": "Hebrew",
+    "he": "Hebrew", "bn": "Bengali",
+}
+_LANG_NAMES_ZH = {
+    "en": "英语", "ko": "韩语", "ja": "日语", "zh-CN": "简体中文",
+    "zh-TW": "繁体中文", "es": "西班牙语", "fr": "法语", "de": "德语",
+    "ru": "俄语", "vi": "越南语", "th": "泰语",
+}
+
+
+class OllamaError(Exception):
+    pass
+
+
+def _keep_alive_value(v):
+    """Ollama takes a duration ("10m") or plain seconds (-1 = forever, 0 = now)."""
+    s = str(v).strip()
+    try:
+        return int(s)
+    except ValueError:
+        return s or "10m"
+
+
+class OllamaTranslator:
+    """Same .translate(text) shape as the deep-translator classes, so the rest
+    of the app does not care which engine is behind it."""
+
+    def __init__(self, source: str, target: str):
+        import requests
+        self.source, self.target = source, target
+        self.url = (str(CONFIG.get("ollama_url", "")).strip()
+                    or OLLAMA_DEFAULT_URL).rstrip("/")
+        self.model = str(CONFIG.get("ollama_model", "")).strip() or OLLAMA_DEFAULT_MODEL
+        self.session = requests.Session()
+        # The server is on this PC. Never route it through a company proxy
+        # from HTTPS_PROXY or the Windows settings - the proxy cannot reach
+        # our localhost and would only turn a working setup into a timeout.
+        self.session.trust_env = False
+
+    def _prompt(self, text: str) -> str:
+        zh = self.target.startswith("zh") or self.source.startswith("zh")
+        if zh:
+            lang = _LANG_NAMES_ZH.get(self.target) or _LANG_NAMES_EN.get(self.target, self.target)
+            return _HYMT_PROMPT_ZH.format(lang=lang, text=text)
+        lang = (_LANG_NAMES_EN.get(self.target)
+                or CODE_TO_NAME.get(self.target, self.target).title())
+        return _HYMT_PROMPT_EN.format(lang=lang, text=text)
+
+    def translate(self, text: str) -> str:
+        prompt = self._prompt(text)
+        if "hy-mt" in self.model.lower():
+            # Ollama's import of the Hy-MT2 GGUF builds a broken chat template
+            # that leaves the user's text out entirely, so the model answers
+            # an empty turn with noise. Build the prompt in the model's own
+            # format (from the chat_template inside the GGUF) and send it raw.
+            endpoint = "generate"
+            body = {"raw": True,
+                    "prompt": _HY_BOS + _HY_USER + prompt + _HY_ASSISTANT}
+            stop = [_HY_EOS, "<｜hy_end▁of▁sentence｜>", _HY_USER]
+        else:
+            endpoint = "chat"
+            body = {"messages": [{"role": "user", "content": prompt}]}
+            stop = None
+        body.update({
+            "model": self.model,
+            "stream": False,
+            # How long Ollama keeps the model in memory after the last request.
+            # After that it is unloaded and the next translation takes a few
+            # seconds longer while it loads again.
+            "keep_alive": _keep_alive_value(CONFIG.get("ollama_keep_alive", "10m")),
+            "options": {
+                # Recommended settings from the Hy-MT2 model card.
+                "temperature": 0.7, "top_p": 0.6, "top_k": 20,
+                "repeat_penalty": 1.05,
+                "num_predict": min(4096, max(256, len(text) * 3)),
+            },
+        })
+        if stop:
+            body["options"]["stop"] = stop
+        r = self.session.post(f"{self.url}/api/{endpoint}", json=body,
+                              timeout=float(CONFIG.get("ollama_timeout_sec", 60)))
+        if r.status_code == 404 and "not found" in r.text.lower():
+            raise OllamaError(f"model not found: {self.model}")
+        if r.status_code != 200:
+            raise OllamaError(f"Ollama HTTP {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        out = data.get("response") if endpoint == "generate" \
+            else (data.get("message") or {}).get("content", "")
+        out = out or ""
+        # A model with a thinking phase would put it in <think>...</think>.
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+        return out
+
+
+def using_local_engine() -> bool:
+    return engine_name() == "ollama"
+
+
+def _build_translator(name: str, source: str, target: str):
+    if name == "ollama":
+        return OllamaTranslator(source, target)
+    if name == "google":
+        return GoogleTranslator(source=source, target=target)
+    key = str(CONFIG.get("api_key", "")).strip()
+    if name == "microsoft":
+        from deep_translator import MicrosoftTranslator
+        return MicrosoftTranslator(api_key=key, source=source, target=target,
+                                   region=str(CONFIG.get("api_region", "")).strip())
+    if name == "libre":
+        from deep_translator import LibreTranslator
+        return LibreTranslator(source=source, target=target,
+                               base_url=str(CONFIG.get("api_url", "")).strip(),
+                               api_key=key)
+    return GoogleTranslator(source=source, target=target)
+
+
+def make_translator(source: str, target: str):
+    """Build (or reuse) the configured translator. Falls back to Google if the
+    chosen engine is not usable, so a half-finished config never stops
+    translation outright - it just keeps working the old way."""
+    name = "google" if engine_problem() else engine_name()
+    cache_key = (name, _engine_fingerprint(name), source, target)
+    with _translator_lock:
+        cached = _translator_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        built = _build_translator(name, source, target)
+    except Exception as e:
+        # The local engine never falls back to Google: the point of choosing
+        # it is that nothing is sent out, so a failure must show as a failure.
+        if name == "ollama":
+            raise
+        # A bad key, an unreachable instance, an unsupported language pair.
+        # Say so once and keep translating with Google rather than going dark.
+        dbg(f"engine {name} could not be initialised: {e}")
+        if name != "google":
+            print(f"[engine] {name} could not be initialised ({type(e).__name__}); "
+                  f"using Google for now. Run --check for details.")
+        built = GoogleTranslator(source=source, target=target)
+
+    with _translator_lock:
+        _translator_cache[cache_key] = built
+    return built
 
 import tkinter as tk
 from tkinter import ttk, colorchooser, messagebox
@@ -283,7 +641,7 @@ DEFAULT_BLOCKED_APPS = [
 ]
 
 DEFAULT_CONFIG = {
-    "version": 2,
+    "version": 3,
     "mode": "multi",            # "multi" | "fixed"
     # multi mode: anything written in one of `other_languages` is translated into
     # `my_language`; anything written in `my_language` goes to `outgoing_language`.
@@ -297,7 +655,33 @@ DEFAULT_CONFIG = {
     "font_scale": 1.0,
     "popup_seconds": 6,
     "max_text_len": 3000,
-    "min_drag_px": 4,
+    # How a capture is triggered. Every capture costs one synthetic Ctrl+C, so
+    # this is the setting that decides how often the app touches your clipboard.
+    #   "drag"      - any mouse drag (most convenient; also fires on window
+    #                 drags, scrollbar drags and anything else you drag)
+    #   "ctrl_drag" - only when Ctrl is held as you release the selection.
+    #                 Ctrl is the one safe modifier to hold: our injected key IS
+    #                 Ctrl+C, so holding Ctrl cannot turn it into something else.
+    #   "hotkey"    - never on a drag. Select normally, then press the hotkey.
+    # Translation engine. "google" is free and needs no key, but shares the
+    # rate limit with every other device behind the same public address.
+    # "deepl" / "microsoft" / "libre" use a key, so the quota is yours.
+    # "ollama" runs a translation model on this PC: free, offline, no limit.
+    "engine": "google",
+    "api_key": "",
+    "api_region": "",
+    "api_url": "",
+    "ollama_url": OLLAMA_DEFAULT_URL,
+    "ollama_model": OLLAMA_DEFAULT_MODEL,
+    "ollama_keep_alive": "10m",   # how long the model stays in memory when idle
+    "ollama_timeout_sec": 60,
+    "trigger": "drag",
+    "hotkey": "<ctrl>+<shift>+t",
+    # A drag shorter than this is ignored, so a click that wobbled a couple of
+    # pixels no longer costs a pointless Ctrl+C.
+    "min_drag_px": 12,
+    # Never capture twice within this many seconds.
+    "capture_cooldown_sec": 0.4,
     "debug": False,
     # Safety of the synthetic Ctrl+C (see grab_selected_text)
     "preserve_clipboard": True,   # save/restore files & images, not just text
@@ -305,9 +689,15 @@ DEFAULT_CONFIG = {
 }
 
 
-def migrate_config(cfg: dict) -> dict:
+def migrate_config(cfg: dict, from_version=None) -> dict:
     """v1 stored a single language pair (lang_a / lang_b, mode 'two_way').
-    v2 stores one home language plus a list of foreign languages."""
+    v2 stores one home language plus a list of foreign languages.
+    v3 raised the minimum drag distance from 4 px to 12 px.
+
+    from_version is the version found in the file on disk, which is not the
+    same as cfg["version"]: cfg has already had the defaults merged into it, so
+    a file with no version key would otherwise look current and skip every
+    migration. Pass None when the file did not say."""
     if cfg.get("mode") == "two_way" or "lang_a" in cfg or "lang_b" in cfg:
         home = cfg.pop("lang_a", None) or cfg.get("my_language") or "ko"
         foreign = cfg.pop("lang_b", None) or "en"
@@ -320,6 +710,23 @@ def migrate_config(cfg: dict) -> dict:
         if cfg.get("mode") == "two_way":
             cfg["mode"] = "multi"
         cfg["version"] = 2
+
+    # A settings save writes the whole config, so anyone who opened Settings on an
+    # older build has min_drag_px: 4 on disk - the old default, not a choice they
+    # made. Leaving it there would keep window drags and scrollbars firing a
+    # Ctrl+C, which is the whole point of this version. Anything they set
+    # deliberately is left alone.
+    try:
+        disk_version = int(from_version or 0)
+    except Exception:
+        disk_version = 0
+    if disk_version < 3:
+        try:
+            if int(cfg.get("min_drag_px", 12)) <= 4:
+                cfg["min_drag_px"] = 12
+        except Exception:
+            cfg["min_drag_px"] = 12
+        cfg["version"] = 3
     return cfg
 
 
@@ -334,7 +741,7 @@ def load_config() -> dict:
                     cfg["colors"].update(v)
                 else:
                     cfg[k] = v
-            cfg = migrate_config(cfg)
+            cfg = migrate_config(cfg, user.get("version"))
         except Exception as e:
             print(f"[config] could not read {CONFIG_PATH}: {e}")
 
@@ -562,6 +969,17 @@ def modifiers_held() -> str | None:
     return None
 
 
+def ctrl_held() -> bool:
+    """Ctrl is the one modifier that is safe to hold while we inject Ctrl+C,
+    because the result is still exactly Ctrl+C."""
+    if not _IS_WINDOWS:
+        return False
+    try:
+        return bool(_u32().GetAsyncKeyState(0x11) & 0x8000)   # VK_CONTROL
+    except Exception:
+        return False
+
+
 def foreground_process_name() -> str:
     if not _IS_WINDOWS:
         return ""
@@ -750,21 +1168,220 @@ def decide_direction(text: str) -> tuple[str, str]:
     return detected, home
 
 
+def explain_error(err: Exception) -> str:
+    """Turn a network exception into one line a person can act on.
+
+    The raw exception is a wall of text - the whole URL-encoded request is in
+    there, so on a long selection the real cause scrolls off the popup
+    entirely. The full text still goes to the log when debug is on."""
+    text = f"{type(err).__name__}: {err}"
+    low = text.lower()
+
+    if using_local_engine():
+        model = str(CONFIG.get("ollama_model", "")).strip() or OLLAMA_DEFAULT_MODEL
+        if "model not found" in low:
+            return (f"The translation model is not downloaded yet. Open a terminal "
+                    f"and run:  ollama pull {model}")
+        if "timed out" in low or "timeout" in low:
+            return ("The local model took too long. The first translation after a "
+                    "while loads the model and can take a few seconds - select "
+                    "again. Very long selections take longer.")
+        if "connection" in low or "refused" in low or "max retries" in low:
+            return ("Ollama is not running. Start it from the Start menu (it then "
+                    "sits in the system tray) and select again.")
+        return text[:300]
+
+    if "certificate_verify_failed" in low or "certificateerror" in low \
+            or "unable to get local issuer" in low or "self-signed certificate" in low:
+        return ("Cannot verify the HTTPS certificate. This is usually a company "
+                "network inspecting traffic with its own certificate, which Python "
+                "does not trust yet. Nothing is blocked - see 'Certificate errors "
+                "on a company network' in the README. Quick fix: run "
+                "'py -m pip install truststore' and restart DragTranslate.")
+    if is_rate_limit(err):
+        return ("Google is rate-limiting the address this network goes out from - "
+                "on a company network that is shared with everyone else, so it is "
+                "not necessarily your own usage. It clears by itself; wait a "
+                "moment and select again. The free endpoint has no quota that can "
+                "be raised.")
+    if "getaddrinfo" in low or "name or service not known" in low \
+            or "nodename nor servname" in low or "temporary failure in name resolution" in low:
+        return ("Cannot resolve translate.google.com. Check that you are online, "
+                "and that DNS or a company firewall is not blocking it.")
+    if "proxy" in low or "407" in low:
+        return ("A network proxy refused the connection. If your company requires "
+                "a proxy, set the HTTPS_PROXY environment variable before starting "
+                "DragTranslate.")
+    if "timed out" in low or "timeout" in low:
+        return "The connection timed out. Select the text again in a moment."
+    if "connection" in low:
+        return ("Could not reach translate.google.com. Check your internet "
+                "connection or company firewall.")
+
+    return text[:300]
+
+
+# --------------------------------------------------------------------------
+# Staying under Google's rate limit
+# --------------------------------------------------------------------------
+# The free endpoint allows roughly five requests a second from one IP address,
+# and that budget is per address, not per machine - behind a company firewall
+# the whole office shares one. Meanwhile a single selection used to cost up to
+# seven requests, because deep-translator's translate_batch() is a plain loop
+# that sends one request per verb. Three things fix that: never ask twice for
+# the same text, never send two requests closer together than we have to, and
+# stop pushing once Google has said no.
+
+RATE_LIMIT_INTERVAL = 0.35      # seconds between outgoing requests
+TEXT_CACHE_MAX = 400
+VERB_CACHE_MAX = 4000
+BACKOFF_STEPS = (3.0, 10.0, 30.0, 60.0)
+VERB_QUIET_PERIOD = 300.0   # no verb lookups for this long after a refusal
+VERB_FETCH_MAX = 2          # new verb lookups per selection; cached ones are free
+
+
+class _Throttle:
+    """Spaces outgoing requests, and holds everything back after a refusal.
+
+    One lock covers both, so the worker thread and anything else sharing the
+    process cannot sidestep the delay by interleaving."""
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self._blocked_until = 0.0
+        self._strikes = 0
+        self._last_refusal = -1e9      # "never", without special-casing it
+
+    def blocked_for(self) -> float:
+        """Seconds still to wait, or 0. Cheap enough to call before any work."""
+        return max(0.0, self._blocked_until - time.time())
+
+    def wait_turn(self) -> None:
+        with self._lock:
+            gap = self.interval - (time.time() - self._last)
+            if gap > 0:
+                time.sleep(gap)
+            self._last = time.time()
+
+    def refused(self) -> float:
+        """Google said no. Back off further each time until something works."""
+        with self._lock:
+            step = BACKOFF_STEPS[min(self._strikes, len(BACKOFF_STEPS) - 1)]
+            self._strikes += 1
+            self._last_refusal = time.time()
+            self._blocked_until = self._last_refusal + step
+            return step
+
+    def refused_recently(self, within: float) -> bool:
+        """True while we are still being careful, after the hard block has
+        expired. Used to keep the optional verb list off the wire."""
+        return (time.time() - self._last_refusal) < within
+
+    def accepted(self) -> None:
+        with self._lock:
+            self._strikes = 0
+            self._blocked_until = 0.0
+
+
+_throttle = _Throttle(RATE_LIMIT_INTERVAL)
+
+
+# "429" on its own is not evidence of anything - it turns up as a line number
+# (_ssl.c:429), a byte count, or part of a URL. Require it to look like a
+# status code, or require the words.
+_RATE_LIMIT_RE = re.compile(
+    r"too\s+many\s+requests"
+    r"|rate[\s_-]?limit"
+    r"|(?:status(?:[\s_]?code)?|http|response|error)\D{0,12}429\b"
+    r"|\b429\b\s*(?:client\s+error|too\s+many|:)",
+    re.I)
+
+
+def is_rate_limit(err: Exception) -> bool:
+    """deep-translator raises TooManyRequests for a 429, so the type name is the
+    reliable signal; the message is only a fallback for anything else."""
+    if "toomanyrequests" in type(err).__name__.lower():
+        return True
+    return bool(_RATE_LIMIT_RE.search(str(err)))
+
+
+class _Cache:
+    """Smallest thing that works: a dict with insertion order as the eviction
+    order. Keeping a translation costs a few hundred bytes and saves a request,
+    which is the scarce resource here."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._d: dict = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            return self._d.get(key)
+
+    def put(self, key, value) -> None:
+        if not value:
+            return
+        with self._lock:
+            self._d[key] = value
+            while len(self._d) > self.limit:
+                self._d.pop(next(iter(self._d)))
+
+    def __len__(self):
+        return len(self._d)
+
+
+_text_cache = _Cache(TEXT_CACHE_MAX)
+_verb_cache = _Cache(VERB_CACHE_MAX)
+
+
 def translate_text(text: str, source: str, target: str) -> str:
     """Always returns a human-readable string, even on failure."""
+    key = (text, source, target)
+    hit = _text_cache.get(key)
+    if hit:
+        dbg("translation served from cache")
+        return hit
+
+    local = using_local_engine()
+    waiting = 0.0 if local else _throttle.blocked_for()
+    if waiting:
+        return (f"[Waiting {waiting:.0f}s before asking Google again - it "
+                f"refused the last request. Nothing is being sent until then. "
+                f"If this keeps repeating, run  py dragtranslate.py --check  "
+                f"in this folder to see what Google is actually replying.]")
+
     last_error = None
     for attempt in range(2):
         try:
-            result = GoogleTranslator(source=source, target=target).translate(text)
+            if not local:
+                _throttle.wait_turn()
+            result = make_translator(source, target).translate(text)
         except Exception as e:
             result, last_error = None, e
         dbg(f"translate {source}->{target} attempt {attempt + 1}: {str(result)[:60]!r}")
         if result and str(result).strip():
+            _throttle.accepted()
+            _text_cache.put(key, str(result))
             return str(result)
+        if last_error:
+            dbg(f"translate error in full: {type(last_error).__name__}: {last_error}")
+            # Locally there is nothing a quick retry would fix: Ollama not
+            # running or a missing model stays that way, and retrying a
+            # timeout would only double the wait.
+            if local:
+                break
+            # Retrying into a rate limit is how a slow-down becomes a block.
+            if not local and is_rate_limit(last_error):
+                held = _throttle.refused()
+                dbg(f"rate limited - holding off for {held:.0f}s")
+                break
         time.sleep(0.3)
 
     if last_error:
-        return f"[Translation failed: {last_error}]"
+        return f"[Translation failed: {explain_error(last_error)}]"
     return "[Translation failed: empty response. Try selecting the text again.]"
 
 
@@ -773,12 +1390,27 @@ _AUX_VERBS = {
     "do", "does", "did", "will", "would", "shall", "should", "can", "could",
     "may", "might", "must",
 }
-MAX_VERBS = 6
+MAX_VERBS = 4
 
 
-def ensure_nltk_data() -> None:
+def ensure_nltk_data(verbose: bool = False) -> list[tuple[str, str]]:
+    """Fetch the English tagger data used for the verb list.
+
+    Called at startup, and by `--fetch-langdata` from the installer. The
+    installer used to run `python -c "import nltk; nltk.download(...)"` as its
+    own process, which never imported this module and so never set up the
+    certificate trust - on a network that inspects TLS every download failed
+    with CERTIFICATE_VERIFY_FAILED. Routing it through here means there is one
+    place that decides how HTTPS is trusted.
+
+    Returns (package, status) pairs; never raises. The verb list is optional,
+    so a failure must not stop the app from starting."""
+    results: list[tuple[str, str]] = []
     if not HAS_NLTK:
-        return
+        if verbose:
+            print("nltk is not installed - the verb list is unavailable.")
+        return [("nltk", "not installed")]
+
     for path, pkg in [
         ("tokenizers/punkt", "punkt"),
         ("tokenizers/punkt_tab", "punkt_tab"),
@@ -787,12 +1419,44 @@ def ensure_nltk_data() -> None:
     ]:
         try:
             nltk.data.find(path)
+            results.append((pkg, "already present"))
+            continue
         except LookupError:
-            try:
+            pass
+        except Exception as e:
+            results.append((pkg, f"could not be checked: {e}"))
+            continue
+
+        try:
+            if verbose:
+                print(f"  downloading {pkg} ...")
+            else:
                 print(f"[setup] downloading language data: {pkg}")
-                nltk.download(pkg, quiet=True)
-            except Exception:
-                pass
+            # quiet=True returns False instead of raising, so check the result.
+            ok = nltk.download(pkg, quiet=not verbose)
+            results.append((pkg, "downloaded" if ok else "download failed"))
+        except Exception as e:
+            results.append((pkg, f"download failed: {explain_error(e)}"))
+
+    if verbose:
+        for pkg, status in results:
+            print(f"  {pkg:<34} {status}")
+    return results
+
+
+def verb_data_ready() -> bool:
+    """Whether the verb list can actually work right now."""
+    if not HAS_NLTK:
+        return False
+    try:
+        nltk.data.find("taggers/averaged_perceptron_tagger_eng")
+        return True
+    except Exception:
+        try:
+            nltk.data.find("taggers/averaged_perceptron_tagger")
+            return True
+        except Exception:
+            return False
 
 
 def extract_verbs(text: str) -> list[str]:
@@ -820,23 +1484,76 @@ def extract_verbs(text: str) -> list[str]:
 
 
 def translate_verbs(verbs: list[str], target: str) -> list[tuple[str, str]]:
+    """The verb list is a convenience, so it never costs a request it can avoid.
+
+    deep-translator's translate_batch() is a loop that sends one request per
+    item, so six verbs meant six requests on top of the sentence itself - the
+    single biggest reason this app hit Google's limit. Business email reuses
+    the same verbs constantly (confirm, check, send, review), so a cache of
+    single words answers most of them for free, and whatever is left is fetched
+    one at a time behind the throttle and abandoned the moment Google objects.
+    """
     if not verbs:
         return []
-    try:
-        out = GoogleTranslator(source="en", target=target).translate_batch(verbs)
-        return [(v, t) for v, t in zip(verbs, out) if t]
-    except Exception as e:
-        dbg("verb translation failed:", e)
-        return []
+
+    out: list[tuple[str, str]] = []
+    fetched = 0
+    for verb in verbs:
+        key = (verb.lower(), target)
+        hit = _verb_cache.get(key)
+        if hit:
+            out.append((verb, hit))
+            continue
+
+        # Never let the optional part of the popup trigger a rate limit, or
+        # extend one that is already running. After a refusal the sentence is
+        # what matters; the verb list goes quiet for a while and shows only
+        # what it already knows.
+        local = using_local_engine()
+        if not local and _throttle.blocked_for():
+            dbg("skipping the rest of the verbs: still backing off")
+            break
+        if not local and _throttle.refused_recently(VERB_QUIET_PERIOD):
+            dbg("verbs are cache-only for now: Google refused us recently")
+            break
+        if fetched >= VERB_FETCH_MAX:
+            dbg(f"verb lookups capped at {VERB_FETCH_MAX} for this selection")
+            break
+        try:
+            if not local:
+                _throttle.wait_turn()
+            got = make_translator("en", target).translate(verb)
+        except Exception as e:
+            dbg("verb translation failed:", e)
+            if is_rate_limit(e):
+                _throttle.refused()
+            break
+        fetched += 1
+        if got and str(got).strip():
+            _throttle.accepted()
+            _verb_cache.put(key, str(got))
+            out.append((verb, str(got)))
+    return out
 
 
 # --------------------------------------------------------------------------
 # Input listeners
 # --------------------------------------------------------------------------
+_last_capture = {"time": 0.0}
+
+
 def _handle_drag_end(x: int, y: int) -> None:
+    # One capture = one synthetic Ctrl+C. Refuse to repeat immediately, so a
+    # burst of quick drags cannot machine-gun the clipboard.
+    now = time.time()
+    if now - _last_capture["time"] < float(CONFIG.get("capture_cooldown_sec", 0.4)):
+        dbg("capture skipped: still within the cooldown")
+        return
+    _last_capture["time"] = now
+
     def worker():
         try:
-            dbg(f"drag finished at ({x},{y})")
+            dbg(f"capture triggered at ({x},{y})")
             text = grab_selected_text()
             if not text:
                 return
@@ -849,6 +1566,9 @@ def _handle_drag_end(x: int, y: int) -> None:
             source, target = decide_direction(text)
             translated = translate_text(text, source, target)
 
+            # Verbs come second on purpose: if the sentence itself was refused,
+            # the throttle is already holding and translate_verbs will return
+            # what it has cached rather than adding to the pile.
             verbs: list[tuple[str, str]] = []
             if CONFIG.get("show_verbs") and source == "en":
                 verbs = translate_verbs(extract_verbs(text), target)
@@ -868,7 +1588,7 @@ def on_move(x, y):
     st = _drag_state
     if st["pressed"] and st["start"] is not None and not st["moved"]:
         sx, sy = st["start"]
-        threshold = int(CONFIG.get("min_drag_px", 4))
+        threshold = int(CONFIG.get("min_drag_px", 12))
         if (x - sx) ** 2 + (y - sy) ** 2 > threshold ** 2:
             st["moved"] = True
 
@@ -883,11 +1603,32 @@ def on_click(x, y, button, pressed):
 
     if pressed:
         _drag_state.update({"pressed": True, "start": (x, y), "moved": False})
-    else:
-        was_drag = _drag_state["moved"]
-        _drag_state.update({"pressed": False, "start": None, "moved": False})
-        if was_drag:
-            _handle_drag_end(x, y)
+        return
+
+    was_drag = _drag_state["moved"]
+    _drag_state.update({"pressed": False, "start": None, "moved": False})
+    if not was_drag:
+        return
+
+    trigger = CONFIG.get("trigger", "drag")
+    if trigger == "hotkey":
+        return                       # drags never capture in this mode
+    if trigger == "ctrl_drag" and not ctrl_held():
+        dbg("drag ignored: Ctrl was not held (trigger = ctrl_drag)")
+        return
+
+    _handle_drag_end(x, y)
+
+
+def on_hotkey():
+    """Capture whatever is selected right now, wherever the pointer is."""
+    if not _enabled["on"]:
+        return
+    try:
+        x, y = mouse.Controller().position
+    except Exception:
+        x, y = 0, 0
+    _handle_drag_end(int(x), int(y))
 
 
 def on_key_press(key):
@@ -903,7 +1644,21 @@ def start_listeners():
     k = keyboard.Listener(on_press=on_key_press)
     k.daemon = True
     k.start()
-    return m, k
+
+    listeners = [m, k]
+    if CONFIG.get("trigger") == "hotkey":
+        try:
+            combo = CONFIG.get("hotkey", "<ctrl>+<shift>+t")
+            hk = keyboard.GlobalHotKeys({combo: on_hotkey})
+            hk.daemon = True
+            hk.start()
+            listeners.append(hk)
+            print(f"Trigger: select text, then press {combo}.")
+        except Exception as e:
+            print(f"[warn] could not register the hotkey {CONFIG.get('hotkey')}: {e}")
+            print("       Falling back to drag mode for this session.")
+            CONFIG["trigger"] = "drag"
+    return tuple(listeners)
 
 
 # --------------------------------------------------------------------------
@@ -1213,6 +1968,13 @@ def code_to_choice(code: str) -> str:
     return f"{name.title()} ({code})"
 
 
+TRIGGER_LABELS = {
+    "drag": "Any drag - most convenient, most clipboard use",
+    "ctrl_drag": "Hold Ctrl while selecting - far fewer",
+    "hotkey": "Select, then press a hotkey - fewest",
+}
+
+
 class SettingsWindow:
     """Language + colour configuration. Also shown once on first launch."""
 
@@ -1220,7 +1982,7 @@ class SettingsWindow:
         self.root = root
         self.on_saved = on_saved
         self.win = tk.Toplevel(root)
-        self.win.title(f"{APP_NAME} - Settings")
+        self.win.title(f"{APP_NAME} v{APP_VERSION} - Settings")
         self.win.resizable(False, False)
         self.win.attributes("-topmost", True)
         try:
@@ -1235,8 +1997,15 @@ class SettingsWindow:
         frm = ttk.Frame(self.win, padding=14)
         frm.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(frm, text=f"{APP_NAME} settings", font=("", 12, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        # The version is here because "is the running app the version I just
+        # installed?" is otherwise unanswerable: replacing the file on disk does
+        # not change the process already running from the old one.
+        head = ttk.Frame(frm)
+        head.grid(row=0, column=0, columnspan=3, sticky="we", pady=(0, 10))
+        ttk.Label(head, text=f"{APP_NAME} settings",
+                  font=("", 12, "bold")).pack(side="left")
+        ttk.Label(head, text=f"v{APP_VERSION}", foreground="#6b7280").pack(
+            side="left", padx=(8, 0), pady=(3, 0))
 
         # --- mode ---
         self.mode = tk.StringVar(value=CONFIG.get("mode", "multi"))
@@ -1329,34 +2098,54 @@ class SettingsWindow:
         ttk.Separator(frm, orient="horizontal").grid(
             row=8, column=0, columnspan=3, sticky="ew", pady=10)
 
+        # --- trigger ---
+        # Each capture sends one synthetic Ctrl+C, so this is what controls how
+        # often the app touches the clipboard at all.
+        ttk.Label(frm, text="Translate when").grid(row=9, column=0, sticky="w", **pad)
+        self.trigger = ttk.Combobox(
+            frm, state="readonly", width=44,
+            values=[TRIGGER_LABELS[k] for k in ("drag", "ctrl_drag", "hotkey")])
+        self.trigger.set(TRIGGER_LABELS.get(CONFIG.get("trigger", "drag"),
+                                            TRIGGER_LABELS["drag"]))
+        self.trigger.grid(row=9, column=1, columnspan=2, sticky="w", **pad)
+
+        ttk.Label(frm, text="Ignore drags shorter than").grid(row=10, column=0, sticky="w", **pad)
+        drag_box = ttk.Frame(frm)
+        drag_box.grid(row=10, column=1, sticky="w", **pad)
+        self.min_drag = tk.Spinbox(drag_box, from_=2, to=100, width=6)
+        self.min_drag.delete(0, "end")
+        self.min_drag.insert(0, str(CONFIG.get("min_drag_px", 12)))
+        self.min_drag.pack(side="left")
+        ttk.Label(drag_box, text=" pixels").pack(side="left")
+
         # --- options ---
         self.show_verbs = tk.BooleanVar(value=bool(CONFIG.get("show_verbs", True)))
         ttk.Checkbutton(frm, text="Show key verbs when the source text is English",
                         variable=self.show_verbs).grid(
-            row=9, column=0, columnspan=3, sticky="w", **pad)
+            row=11, column=0, columnspan=3, sticky="w", **pad)
 
-        ttk.Label(frm, text="Popup duration (seconds)").grid(row=10, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Popup duration (seconds)").grid(row=12, column=0, sticky="w", **pad)
         self.duration = tk.Spinbox(frm, from_=2, to=60, width=6)
         self.duration.delete(0, "end")
         self.duration.insert(0, str(CONFIG.get("popup_seconds", 6)))
-        self.duration.grid(row=10, column=1, sticky="w", **pad)
+        self.duration.grid(row=12, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Text size").grid(row=11, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Text size").grid(row=13, column=0, sticky="w", **pad)
         self.font_scale = ttk.Combobox(
             frm, values=["Small (0.9)", "Normal (1.0)", "Large (1.15)", "Extra large (1.3)"],
             state="readonly", width=18)
         self.font_scale.set({0.9: "Small (0.9)", 1.0: "Normal (1.0)",
                              1.15: "Large (1.15)", 1.3: "Extra large (1.3)"}
                             .get(float(CONFIG.get("font_scale", 1.0)), "Normal (1.0)"))
-        self.font_scale.grid(row=11, column=1, sticky="w", **pad)
+        self.font_scale.grid(row=13, column=1, sticky="w", **pad)
 
         self.debug = tk.BooleanVar(value=bool(CONFIG.get("debug", False)))
         ttk.Checkbutton(frm, text="Write a debug log (records translated text - off by default)",
-                        variable=self.debug).grid(row=12, column=0, columnspan=3, sticky="w", **pad)
+                        variable=self.debug).grid(row=14, column=0, columnspan=3, sticky="w", **pad)
 
         # --- buttons ---
         btns = ttk.Frame(frm)
-        btns.grid(row=13, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        btns.grid(row=15, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="Cancel", command=self.cancel).pack(side="right", padx=(8, 0))
         ttk.Button(btns, text="Save", command=self.save).pack(side="right")
 
@@ -1491,10 +2280,18 @@ class SettingsWindow:
         except Exception:
             seconds = 6
 
+        try:
+            min_drag = max(2, min(100, int(float(self.min_drag.get()))))
+        except Exception:
+            min_drag = 12
+
+        chosen = self.trigger.get()
+        trigger = next((k for k, v in TRIGGER_LABELS.items() if v == chosen), "drag")
+
         scale_match = re.search(r"\(([\d.]+)\)", self.font_scale.get())
 
         CONFIG.update({
-            "version": 2,
+            "version": 3,
             "mode": mode,
             "my_language": home,
             "other_languages": others,
@@ -1503,6 +2300,8 @@ class SettingsWindow:
             "target": choice_to_code(self.cmb_t.get()),
             "colors": self.color_vars,
             "show_verbs": bool(self.show_verbs.get()),
+            "trigger": trigger,
+            "min_drag_px": min_drag,
             "popup_seconds": seconds,
             "font_scale": float(scale_match.group(1)) if scale_match else 1.0,
             "debug": bool(self.debug.get()),
@@ -1566,7 +2365,7 @@ def make_tray_icon(root: tk.Tk):
     def refresh(icon):
         on = _enabled["on"]
         icon.icon = make_image(on)
-        icon.title = f"{APP_NAME} - {'on' if on else 'off'}"
+        icon.title = f"{APP_NAME} v{APP_VERSION} - {'on' if on else 'off'}"
         icon.update_menu()
 
     def on_toggle(icon, item):
@@ -1624,11 +2423,237 @@ def ensure_single_instance() -> bool:
     return True
 
 
+def _check_ollama() -> int:
+    """--check for the local engine: is Ollama up, is the model there, and how
+    long does a real translation take."""
+    t = OllamaTranslator("en", CONFIG.get("my_language", "ko"))
+    print(f"Ollama URL      : {t.url}")
+    print(f"Model           : {t.model}")
+    print("-" * 60)
+    try:
+        r = t.session.get(f"{t.url}/api/tags", timeout=5)
+        names = [m.get("name", "") for m in r.json().get("models", [])]
+    except Exception as e:
+        print(f"FAIL  Ollama is not reachable: {type(e).__name__}")
+        print("      Start Ollama from the Start menu, then run --check again.")
+        return 1
+    print(f"OK    Ollama is running ({len(names)} model(s) installed)")
+    if not any(n == t.model or n.split(":")[0] == t.model.split(":")[0] for n in names):
+        print(f"FAIL  model not downloaded. Run:  ollama pull {t.model}")
+        return 1
+    print("OK    model is downloaded")
+    sample = "Please review the attached document and send me your feedback by Friday."
+    for label in ("first (may include loading)", "second (model warm)"):
+        start = time.time()
+        try:
+            out = t.translate(sample)
+        except Exception as e:
+            print(f"FAIL  translation failed: {explain_error(e)}")
+            return 1
+        print(f"OK    {label}: {time.time() - start:.1f}s")
+    print(f"      {sample}")
+    print(f"   -> {out}")
+    return 0
+
+
+def run_check() -> int:
+    """`dragtranslate.py --check` - prove where an HTTPS failure comes from.
+
+    The useful line is the certificate issuer. On a home network it is a public
+    CA (DigiCert, Google Trust Services). On a company network it is the
+    company's own inspection appliance, which is the whole explanation for
+    CERTIFICATE_VERIFY_FAILED."""
+    import ssl
+    import socket
+
+    print(f"{APP_NAME} v{APP_VERSION} connectivity check")
+    print("=" * 60)
+    print(f"Python          : {sys.version.split()[0]}  ({sys.executable})")
+    _eng = engine_name()
+    _problem = engine_problem()
+    print(f"Engine          : {_eng} - {ENGINES[_eng]['label']}")
+    if _problem:
+        print(f"                  NOT USABLE: {_problem}")
+        print(f"                  falling back to Google for now")
+    if _eng == "ollama":
+        return _check_ollama()
+    print(f"Trust source    : {SSL_TRUST_SOURCE}")
+    print(f"User-Agent      : {'browser' if USING_BROWSER_UA else 'python-requests (patch failed)'}")
+    print(f"Verb list       : {'data ready' if verb_data_ready() else 'language data MISSING - run --fetch-langdata'}")
+    print(f"Request spacing : {RATE_LIMIT_INTERVAL}s min gap, "
+          f"cached: {len(_text_cache)} texts / {len(_verb_cache)} verbs")
+    held = _throttle.blocked_for()
+    print(f"Rate limit      : {'backing off for %.0fs' % held if held else 'not backing off'}")
+    try:
+        import truststore  # noqa: F401
+        print("truststore      : installed")
+    except ImportError:
+        print("truststore      : NOT installed  (py -m pip install truststore)")
+    try:
+        import certifi
+        print(f"certifi         : {certifi.where()}")
+    except Exception:
+        print("certifi         : not installed")
+    for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY"):
+        if os.environ.get(var):
+            print(f"{var:<16}: {os.environ[var]}")
+
+    print("-" * 60)
+    host = "translate.google.com"
+    try:
+        with socket.create_connection((host, 443), timeout=10) as sock:
+            # Deliberately unverified: we want to SEE the certificate, including
+            # the one that would fail verification. Nothing is sent over it.
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+        issuer = "unknown"
+        try:
+            import subprocess
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".der", delete=False) as fh:
+                fh.write(der)
+                der_path = fh.name
+            out = subprocess.run(["openssl", "x509", "-inform", "der", "-in",
+                                  der_path, "-noout", "-issuer"],
+                                 capture_output=True, text=True, timeout=10)
+            os.unlink(der_path)
+            if out.returncode == 0:
+                issuer = out.stdout.strip()
+        except Exception:
+            pass
+        if issuer == "unknown":
+            # openssl is not on PATH (normal on Windows). The issuer's common
+            # name is still readable straight out of the DER bytes.
+            try:
+                text = der.decode("latin-1")
+                names = re.findall(r"[\x20-\x7e]{6,}", text)
+                issuer = " | ".join(names[:6])
+            except Exception:
+                pass
+        print(f"Certificate presented by {host}:")
+        print(f"  issuer: {issuer}")
+        print("  If that names your company or a security vendor (Zscaler,")
+        print("  Netskope, Fortinet, Palo Alto, Sophos, Forcepoint...) then your")
+        print("  network is inspecting TLS, and that is the cause.")
+    except Exception as e:
+        print(f"Could not even open a socket to {host}: {e}")
+
+    print("-" * 60)
+    try:
+        sample = make_translator("en", "ko").translate("hello")
+        print(f"Live translation: OK  ('hello' -> {sample!r})")
+        return 0
+    except Exception as e:
+        print("Live translation: FAILED")
+        print(f"  {explain_error(e)}")
+
+    # A failure tells you something went wrong, not who said so. A 429 from
+    # Google and a 429 from the firewall in front of it produce the identical
+    # exception, and they call for opposite responses - so look at the reply.
+    print("-" * 60)
+    print("Asking the endpoint directly, to see who is answering:")
+
+    def probe(label, ua):
+        import requests
+        headers = {"User-Agent": ua} if ua else {}
+        r = requests.get("https://translate.google.com/m",
+                         params={"tl": "ko", "sl": "en", "q": "hello"},
+                         timeout=20, headers=headers)
+        body = r.text or ""
+        found = "-"
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(body, "html.parser")
+            el = (soup.find("div", {"class": "t0"})
+                  or soup.find("div", {"class": "result-container"}))
+            found = repr(el.get_text(strip=True)[:40]) if el else "NOT FOUND"
+        except Exception:
+            found = "(bs4 missing)"
+        print(f"  {label:<16} HTTP {r.status_code}  "
+              f"server={r.headers.get('server', '?')!r}  "
+              f"{len(body):>6} bytes  translation: {found}")
+        return r, body
+
+    try:
+        r, body = probe("browser UA", BROWSER_UA)
+        try:
+            # deep-translator sends no User-Agent of its own, so this is the
+            # request the app actually makes.
+            probe("python-requests", None)
+        except Exception as e:
+            print(f"  python-requests  failed: {explain_error(e)}")
+
+        low = body.lower()
+        vendors = [
+            ("fortiguard", "FortiGuard (Fortinet)"), ("fortigate", "FortiGate (Fortinet)"),
+            ("zscaler", "Zscaler"), ("netskope", "Netskope"), ("bluecoat", "Blue Coat"),
+            ("forcepoint", "Forcepoint"), ("websense", "Forcepoint / Websense"),
+            ("sophos", "Sophos"), ("palo alto", "Palo Alto Networks"),
+            ("mcafee", "McAfee / Skyhigh"), ("barracuda", "Barracuda"),
+            ("checkpoint", "Check Point"), ("squid", "Squid proxy"),
+        ]
+        hit = next((name for key, name in vendors if key in low), None)
+        blocked_words = ("web page blocked", "access denied", "blocked by",
+                         "not permitted", "security policy", "url is blocked",
+                         "차단", "허용되지 않")
+
+        print()
+        if r.status_code == 429:
+            served_by = (r.headers.get("server") or "").lower()
+            if hit or "fortinet" in served_by:
+                print(f"  >>> The 429 came from {hit or 'the firewall'}, not Google.")
+                print("  >>> That is a limit your own network is applying.")
+            elif ("esf" in served_by or "gws" in served_by
+                  or "scaffolding" in served_by):
+                print("  >>> The 429 came from Google itself.")
+                print(f"  >>> (server: {r.headers.get('server')!r} - Google's own")
+                print("  >>>  error-page infrastructure, not your firewall.)")
+                print("  >>> Google is throttling this network's shared public")
+                print("  >>> address. Nothing in this app can raise that: the limit")
+                print("  >>> follows the address, not the machine or the software.")
+                print("  >>> The durable fix is an API key, which carries its own")
+                print("  >>> quota - see 'Using an API key instead' in the README.")
+            else:
+                print(f"  >>> HTTP 429 from an unidentified server "
+                      f"({r.headers.get('server', 'no Server header')}).")
+        elif hit or any(w in low for w in blocked_words):
+            print(f"  >>> This is a web-filter block page"
+                  f"{f' from {hit}' if hit else ''}, not Google.")
+        elif r.status_code == 200:
+            print("  >>> Google answered normally. If translation still fails, the")
+            print("  >>> limit is intermittent - try --check again in a minute.")
+
+        print(f"\n  first 300 chars: {' '.join(body.split())[:300]!r}")
+    except Exception as e:
+        print(f"  the request itself failed: {explain_error(e)}")
+
+    return 1
+
+
 def main():
     global _popup_manager
 
+    if "--check" in sys.argv:
+        raise SystemExit(run_check())
+
+    if "--fetch-langdata" in sys.argv:
+        # The installer calls this instead of running nltk.download in a bare
+        # python -c, so the download uses the same certificate trust as the app.
+        print(f"{APP_NAME} v{APP_VERSION} - English language data")
+        print(f"Trust source: {SSL_TRUST_SOURCE}")
+        results = ensure_nltk_data(verbose=True)
+        bad = [p for p, st in results if "fail" in st or "not installed" in st]
+        if bad:
+            print("\nThe verb list will be unavailable. Translation is unaffected.")
+        else:
+            print("\nLanguage data is ready.")
+        raise SystemExit(1 if bad else 0)
+
     if not ensure_single_instance():
-        print(f"{APP_NAME} is already running (check the system tray).")
+        print(f"{APP_NAME} v{APP_VERSION} is already running (check the system tray).")
         return
 
     first_run = not os.path.exists(CONFIG_PATH)
@@ -1652,7 +2677,7 @@ def main():
     start_listeners()
     make_tray_icon(root)
 
-    print(f"{APP_NAME} is running. Select text anywhere to translate it.")
+    print(f"{APP_NAME} v{APP_VERSION} is running. Select text anywhere to translate it.")
     print(f"Mode: {CONFIG.get('mode')} | config: {CONFIG_PATH}")
     print("Use the system tray icon to toggle it on/off, change settings, or quit.")
 

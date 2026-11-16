@@ -47,3 +47,25 @@ free public web endpoint rather than the official paid Cloud Translation API. Th
 is not covered by any licence granted to this project, and Google's Terms of Service govern
 its use. It is suitable for personal use; for commercial products, switch to an official
 paid API or a local translation engine.
+
+## truststore
+
+Verifies HTTPS against the operating system's trust store (Windows CryptoAPI, macOS
+Security framework) instead of a bundled CA list, so DragTranslate keeps working on a
+network that inspects TLS with a private root certificate.
+Licence: MIT. https://github.com/sethmlarson/truststore
+
+## certifi
+
+Fallback CA bundle, used when truststore is unavailable.
+Licence: MPL-2.0. https://github.com/certifi/python-certifi
+
+## Ollama and Hy-MT2 (optional, not bundled)
+
+With `"engine": "ollama"`, DragTranslate talks to a separately installed Ollama
+(https://ollama.com, MIT) running Tencent Hy-MT2-1.8B
+(https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF, Apache-2.0). Neither is shipped with
+this project; you install and download them yourself, under their own licences.
+Model: Hy-MT2-1.8B, Q4_K_M GGUF, by Tencent Hunyuan. Paper: Zheng et al., "Hy-MT2: A
+Family of Fast, Efficient and Powerful Multilingual Translation Models in the Wild",
+arXiv:2605.22064 (2026), https://arxiv.org/abs/2605.22064
